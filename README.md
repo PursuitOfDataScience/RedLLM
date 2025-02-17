@@ -1,4 +1,4 @@
-# Dream of the Red Chamber LLM Pretraining
+# Dream of the Red Chamber (红楼梦) LLM Pretraining
 
 This project is dedicated to pretraining a large language model (LLM) on the classic Chinese novel *Dream of the Red Chamber* (红楼梦). This classic 18th-century novel, written by Cao Xueqin, is my favoriate Chinese classical literature and offers a rich tapestry of character studies, intricate relationships, and profound insights into Qing Dynasty society, making it an ideal corpus for training a language model with a deep understanding of classical Chinese literature and cultural nuance. By leveraging this timeless masterpiece, the goal is to capture its rich narrative style, intricate language, and cultural nuances in a transformer-based model. 
 

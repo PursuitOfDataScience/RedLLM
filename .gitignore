@@ -1,2 +1,3 @@
 pre-trained/*
 __pycache__
+*.sh

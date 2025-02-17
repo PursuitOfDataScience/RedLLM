@@ -206,8 +206,19 @@ class MLP(nn.Module):
 # Distributed Training Setup for DDP
 #####################################
 
+# def setup(rank, world_size):
+#     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
 def setup(rank, world_size):
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Explicitly set the CUDA device for the current process
+    torch.cuda.set_device(rank)
+    # Initialize the distributed process group using the NCCL backend
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        rank=rank,
+        world_size=world_size
+    )
 
 def cleanup():
     dist.destroy_process_group()
@@ -238,7 +249,7 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     model = GPT(config_model).to(device)
     model = DDP(model, device_ids=[rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
-    batch_size = 64
+    batch_size = 24
 
     dataset_size = len(data)
     print('dataset_size:', dataset_size)
@@ -246,7 +257,7 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     print('batches_per_epoch:', batches_per_epoch)
     global_step = 0
 
-    for epoch in range(2000):
+    for epoch in range(1000):
         for batch in range(batches_per_epoch): 
             global_step += 1
             x, y = get_batch(data, batch_size, block_size, device)
@@ -263,6 +274,9 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
                 generated = model.module.generate(prompt_tensor, max_new_tokens=200)
                 generated_text = hf_tokenizer.decode(generated[0].tolist())
                 print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+
+            # if rank == 1:
+            #     print(f"Rank 1 | Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
 
             if global_step % 5000 == 0 and rank == 0:
                 checkpoint = {

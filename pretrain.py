@@ -1,19 +1,7 @@
-'''
-    # On node 0 (master node)
-    torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 --master_addr="192.168.1.100" --master_port=29500 ddp_pretrain_bpe.py
-
-    # On node 1 (worker node)
-    torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 --master_addr="192.168.1.100" --master_port=29500 ddp_pretrain_bpe.py
-
-    
-    For one node only
-    torchrun --nproc_per_node=<num_gpus> your_script.py
-
-'''
-
 # ddp_pretrain_bpe.py
 import os
 import math
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,32 +9,66 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tokenizers import ByteLevelBPETokenizer
+from transformers import (
+    PreTrainedTokenizerFast,
+    PretrainedConfig,
+    PreTrainedModel,
+    AutoModelForCausalLM,
+    AutoTokenizer
+)
 
 #####################################
 # BPE Tokenizer Utilities
 #####################################
 
 def train_bpe_tokenizer(file_path, vocab_size=5000):
-    """Train a ByteLevel BPE tokenizer on the text and save it."""
+    """Train a ByteLevel BPE tokenizer on the text and save it in Hugging Face format."""
+    # Train using the tokenizers library
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train([file_path], vocab_size=vocab_size, min_frequency=2,
                     special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
     os.makedirs("bpe_tokenizer", exist_ok=True)
+    # Save raw vocab and merges files (for reference)
     tokenizer.save_model("bpe_tokenizer")
-    return tokenizer
+    # Save the full tokenizer JSON representation
+    with open(os.path.join("bpe_tokenizer", "tokenizer.json"), "w", encoding="utf-8") as f:
+        f.write(tokenizer._tokenizer.to_str())
+    # Create a tokenizer configuration
+    tokenizer_config = {
+        "model_max_length": 1024,
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+        "unk_token": "<unk>",
+        "pad_token": "<pad>",
+        "mask_token": "<mask>"
+    }
+    with open(os.path.join("bpe_tokenizer", "tokenizer_config.json"), "w") as f:
+        json.dump(tokenizer_config, f)
+    # Create a Hugging Face PreTrainedTokenizerFast instance using the saved tokenizer.json file
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=os.path.join("bpe_tokenizer", "tokenizer.json"),
+        bos_token="<s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        pad_token="<pad>",
+        mask_token="<mask>"
+    )
+    hf_tokenizer.save_pretrained("bpe_tokenizer")
+    return hf_tokenizer
 
 def load_bpe_tokenizer():
-    """Load a previously trained BPE tokenizer."""
-    tokenizer = ByteLevelBPETokenizer("bpe_tokenizer/vocab.json", "bpe_tokenizer/merges.txt")
-    return tokenizer
+    """Load a previously trained BPE tokenizer in Hugging Face format."""
+    hf_tokenizer = PreTrainedTokenizerFast.from_pretrained("bpe_tokenizer", use_fast=True)
+    return hf_tokenizer
 
 def load_data_bpe(file_path, tokenizer):
-    """Read the text file, encode with the BPE tokenizer, and return a tensor of token IDs."""
+    """Read the text file, encode it with the BPE tokenizer, and return a tensor of token IDs."""
     with open(file_path, 'r', encoding='utf-8') as f:
         text = f.read()
-    encoding = tokenizer.encode(text)
-    data = torch.tensor(encoding.ids, dtype=torch.long)
-    return data, tokenizer.get_vocab_size()
+    # Use the returned list of token IDs directly
+    token_ids = tokenizer.encode(text)
+    data = torch.tensor(token_ids, dtype=torch.long)
+    return data, tokenizer.vocab_size
 
 def get_batch(data, batch_size, block_size, device):
     """Randomly sample a batch of contiguous sequences from the tokenized data."""
@@ -57,11 +79,13 @@ def get_batch(data, batch_size, block_size, device):
     return x, y
 
 #####################################
-# Model Definition
+# Model Definition - Updated for HF compatibility
 #####################################
 
-class GPTConfig:
-    def __init__(self, vocab_size, block_size, n_layer, n_head, n_embd, dropout=0.1):
+class GPTConfig(PretrainedConfig):
+    model_type = "gpt_custom"
+    def __init__(self, vocab_size, block_size, n_layer, n_head, n_embd, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layer = n_layer
@@ -69,26 +93,22 @@ class GPTConfig:
         self.n_embd = n_embd
         self.dropout = dropout
 
-class GPT(nn.Module):
+class GPT(PreTrainedModel):
+    config_class = GPTConfig
     def __init__(self, config):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
         self.position_embedding = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        # Manually initialize parameters not handled by modules (e.g. position_embedding)
         nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
-        for block in self.blocks:
-            block.apply(self._init_weights_block)
-        nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
+        # post_init will call self.apply(self._init_weights)
+        self.post_init()
 
-    def _init_weights_block(self, module):
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -113,19 +133,15 @@ class GPT(nn.Module):
         return logits, loss
     
     def generate(self, input_ids, max_new_tokens, temperature=0.7, top_k=None):
-        self.eval()  # Switch to evaluation mode
+        self.eval()
         generated = input_ids
         for _ in range(max_new_tokens):
-            # Use the last tokens (limit to block size if needed)
             input_cond = generated if generated.shape[1] <= self.config.block_size else generated[:, -self.config.block_size:]
             logits, _ = self(input_cond)
-            # Select the logits of the last token
             logits = logits[:, -1, :] / temperature
-            
             if top_k is not None:
-                values, indices = torch.topk(logits, top_k)
+                values, _ = torch.topk(logits, top_k)
                 logits[logits < values[:, -1:]] = -float('Inf')
-            
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat((generated, next_token), dim=1)
@@ -191,7 +207,6 @@ class MLP(nn.Module):
 #####################################
 
 def setup(rank, world_size):
-    # Environment variables like MASTER_ADDR and MASTER_PORT should be set externally (e.g. via torchrun)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup():
@@ -201,17 +216,17 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     setup(rank, world_size)
     device = torch.device(f'cuda:{rank}')
     
-    # Train (or load) the BPE tokenizer
+    # Only rank 0 trains the tokenizer if needed.
     if not os.path.exists("bpe_tokenizer/vocab.json"):
         if rank == 0:
             print("Training BPE tokenizer...")
-        tokenizer = train_bpe_tokenizer(data_path, vocab_size=5000)
-    else:
-        tokenizer = load_bpe_tokenizer()
+            _ = train_bpe_tokenizer(data_path, vocab_size=5000)
+        dist.barrier()
+    hf_tokenizer = load_bpe_tokenizer()
     
-    # Load data using the BPE tokenizer
-    data, vocab_size = load_data_bpe(data_path, tokenizer)
-    block_size = 256  # context window size
+    # Load data using the tokenizer
+    data, vocab_size = load_data_bpe(data_path, hf_tokenizer)
+    block_size = 256
 
     config_model = GPTConfig(vocab_size=vocab_size, 
                              block_size=block_size,
@@ -223,19 +238,15 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     model = GPT(config_model).to(device)
     model = DDP(model, device_ids=[rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
-    batch_size = 64  # per GPU
+    batch_size = 64
 
-    # Define training by epochs.
-    num_epochs = 2000
-    # Here we assume data is a 1D tensor of token indices.
     dataset_size = len(data)
     print('dataset_size:', dataset_size)
-    # Calculate how many batches constitute one epoch.
     batches_per_epoch = dataset_size // (batch_size * block_size)
     print('batches_per_epoch:', batches_per_epoch)
     global_step = 0
 
-    for epoch in range(num_epochs): #for epoch in range(start_epoch, num_epochs):
+    for epoch in range(2000):
         for batch in range(batches_per_epoch): 
             global_step += 1
             x, y = get_batch(data, batch_size, block_size, device)
@@ -246,39 +257,34 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
             
             if global_step % 100 == 0 and rank == 0:
                 print(f"Rank {rank} | Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
-
-                # Specify desired prompt string
                 prompt_str = "只见这袭人在床上睡着了，"
-                prompt_tokens = tokenizer.encode(prompt_str)
-                prompt_ids = prompt_tokens.ids  # Extract list of integers from the Encoding object
-                prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
-
-                # Generate text starting from the prompt.
+                token_ids = hf_tokenizer.encode(prompt_str)
+                prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(device)
                 generated = model.module.generate(prompt_tensor, max_new_tokens=200)
-                generated_text = tokenizer.decode(generated[0].tolist())
+                generated_text = hf_tokenizer.decode(generated[0].tolist())
                 print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
             if global_step % 5000 == 0 and rank == 0:
                 checkpoint = {
                     "epoch": epoch,
                     "global_step": global_step,
-                    "model_state_dict": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
+                    "model_state_dict": model.module.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": loss.item()
                 }
                 torch.save(checkpoint, f"pre-trained/hongloumeng_checkpoint_step_{global_step}.pth")
                 print(f"Checkpoint saved at step {global_step}")
-
     
     if rank == 0:
-        torch.save(model.module.state_dict(), "pre-trained/hongloumeng_final.pth")
-        print("DDP training with BPE complete; model saved as 'hongloumeng.pth'")
+        # Save the final model and tokenizer in Hugging Face format
+        model.module.save_pretrained("RedLLM")
+        hf_tokenizer.save_pretrained("RedLLM")
+        print("DDP training complete; model and tokenizer saved in 'RedLLM'")
     cleanup()
 
 def main():
     world_size = torch.cuda.device_count()
     mp.spawn(train_ddp, args=(world_size,), nprocs=world_size, join=True)
-
 
 if __name__ == "__main__":
     main()

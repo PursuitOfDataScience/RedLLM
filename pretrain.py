@@ -5,7 +5,6 @@ In the slurm script, additional setup such as MASTER_ADDR and MASTER_PORT might 
 
 '''
 
-# ddp_pretrain_bpe.py
 import os
 import math
 import torch

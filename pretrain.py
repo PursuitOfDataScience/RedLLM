@@ -1,13 +1,7 @@
 '''
-    # On node 0 (master node)
-    torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 --master_addr="192.168.1.100" --master_port=29500 ddp_pretrain_bpe.py
+When running the script on multiple GPUs on the same node, just simply run as python pretrain.py
 
-    # On node 1 (worker node)
-    torchrun --nnodes=2 --node_rank=1 --nproc_per_node=8 --master_addr="192.168.1.100" --master_port=29500 ddp_pretrain_bpe.py
-
-    
-    For one node only
-    torchrun --nproc_per_node=<num_gpus> your_script.py
+In the slurm script, additional setup such as MASTER_ADDR and MASTER_PORT might be needed.
 
 '''
 

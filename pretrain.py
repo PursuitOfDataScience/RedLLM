@@ -1,4 +1,3 @@
-# ddp_pretrain_bpe.py
 import os
 import math
 import json

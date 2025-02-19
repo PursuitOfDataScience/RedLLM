@@ -8,6 +8,7 @@ In the slurm script, additional setup such as MASTER_ADDR and MASTER_PORT might 
 import os
 import math
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -204,22 +205,22 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     
     # Load data using the BPE tokenizer
     data, vocab_size = load_data_bpe(data_path, tokenizer)
-    block_size = 256  # context window size
+    block_size = 512  # context window size
 
     config_model = GPTConfig(vocab_size=vocab_size, 
                              block_size=block_size,
                              n_layer=12, 
                              n_head=12, 
-                             n_embd=768, 
+                             n_embd=1008, 
                              dropout=0.1)
     
     model = GPT(config_model).to(device)
     model = DDP(model, device_ids=[rank])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
-    batch_size = 64  # per GPU
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    batch_size = 84  # per GPU
 
     # Define training by epochs.
-    num_epochs = 2000
+    num_epochs = 500
     # Here we assume data is a 1D tensor of token indices.
     dataset_size = len(data)
     print('dataset_size:', dataset_size)
@@ -228,7 +229,7 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     print('batches_per_epoch:', batches_per_epoch)
     global_step = 0
 
-    for epoch in range(num_epochs): #for epoch in range(start_epoch, num_epochs):
+    for epoch in tqdm(range(num_epochs)): #for epoch in range(start_epoch, num_epochs):
         for batch in range(batches_per_epoch): 
             global_step += 1
             x, y = get_batch(data, batch_size, block_size, device)
@@ -237,17 +238,17 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
             loss.backward()
             optimizer.step()
             
-            if global_step % 100 == 0 and rank == 0:
+            if global_step % 50 == 0 and rank == 0:
                 print(f"Rank {rank} | Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
 
                 # Specify desired prompt string
-                prompt_str = "只见这袭人在床上睡着了，"
+                prompt_str = "宝姐姐突然皱眉，"
                 prompt_tokens = tokenizer.encode(prompt_str)
                 prompt_ids = prompt_tokens.ids  # Extract list of integers from the Encoding object
                 prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
 
                 # Generate text starting from the prompt.
-                generated = model.module.generate(prompt_tensor, max_new_tokens=200)
+                generated = model.module.generate(prompt_tensor, max_new_tokens=300)
                 generated_text = tokenizer.decode(generated[0].tolist())
                 print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
 
@@ -264,12 +265,13 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
 
     
     if rank == 0:
-        torch.save(model.module.state_dict(), "pre-trained/hongloumeng_final.pth")
+        torch.save(model.module.state_dict(), "pre-trained/hongloumeng_final_2025-02-18.pth")
         print("DDP training with BPE complete; model saved as 'hongloumeng.pth'")
     cleanup()
 
 def main():
     world_size = torch.cuda.device_count()
+    print(f'world size: {world_size}')
     mp.spawn(train_ddp, args=(world_size,), nprocs=world_size, join=True)
 
 

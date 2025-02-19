@@ -1,41 +1,40 @@
-from tokenizers import ByteLevelBPETokenizer
 import torch
-from pretrain import GPT, load_bpe_tokenizer, GPTConfig
+from transformers import AutoTokenizer
+from pretrain_ddp import GPTConfig, GPT
 
-tokenizer = load_bpe_tokenizer()
+def main():
+    # Path to your saved model folder
+    model_dir = "RedLLM"
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 1) Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
+    # 2) Load the model
+    config = GPTConfig.from_pretrained("RedLLM")
+    model = GPT.from_pretrained("RedLLM", config=config)
+    model.to("cuda")
+    # 3) Compute number of parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params} ({total_params/1e6:.2f} million)")
 
-# Initialize your model
-vocab_size = tokenizer.get_vocab_size()
-block_size = 256  # context window size
-config_model = GPTConfig(vocab_size=vocab_size, 
-                            block_size=block_size,
-                            n_layer=12, 
-                            n_head=12, 
-                            n_embd=768, 
-                            dropout=0.1)
+    # 4) Simple inference / text generation
+    prompt = "花袭人有始有终，"
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    input_ids = input_ids.to("cuda")
 
-model = GPT(config_model)
+    model.eval()
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids, 
+            max_new_tokens=500, 
+            temperature=0.8,   
+            top_k=50           
+        )
 
-# Load the pre-trained weights
-checkpoint_path = "pre-trained/hongloumeng_final.pth"
-state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=True)
-model.load_state_dict(state_dict)
+    # 5) Decode and print
+    generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    print("Generated text:")
+    print(generated_text)
 
-# Set the model to evaluation mode
-model.eval()
-
-model.to(device)
-
-# Specify desired prompt string
-prompt_str = "花袭人有始有终"
-prompt_tokens = tokenizer.encode(prompt_str)
-prompt_ids = prompt_tokens.ids  # Extract list of integers from the Encoding object
-prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(0).to(device)
-
-# Generate text starting from the prompt.
-generated = model.generate(prompt_tensor, max_new_tokens=400)
-generated_text = tokenizer.decode(generated[0].tolist())
-print(f"\n--- Generated text \n{generated_text}\n")
+if __name__ == "__main__":
+    main()

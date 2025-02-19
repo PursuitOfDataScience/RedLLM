@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm import tqdm
 from tokenizers import ByteLevelBPETokenizer
 from transformers import (
     PreTrainedTokenizerFast,
@@ -83,7 +84,7 @@ def get_batch(data, batch_size, block_size, device):
 
 class GPTConfig(PretrainedConfig):
     model_type = "gpt_custom"
-    def __init__(self, vocab_size, block_size, n_layer, n_head, n_embd, dropout=0.1, **kwargs):
+    def __init__(self, vocab_size=5000, block_size=1024, n_layer=12, n_head=12, n_embd=768, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.block_size = block_size
@@ -237,6 +238,7 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     # Load data using the tokenizer
     data, vocab_size = load_data_bpe(data_path, hf_tokenizer)
     block_size = 256
+    epochs = 500
 
     config_model = GPTConfig(vocab_size=vocab_size, 
                              block_size=block_size,
@@ -248,6 +250,11 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     model = GPT(config_model).to(device)
     model = DDP(model, device_ids=[rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
+
+
+    # adding AMP autoscaler
+    scaler = torch.amp.GradScaler("cuda")
+
     batch_size = 24
 
     dataset_size = len(data)
@@ -256,15 +263,28 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
     print('batches_per_epoch:', batches_per_epoch)
     global_step = 0
 
-    for epoch in range(1000):
+    # from transformers import get_linear_schedule_with_warmup
+
+    # num_training_steps = epochs * batches_per_epoch
+    # num_warmup_steps = int(0.1 * num_training_steps)
+
+    # scheduler = get_linear_schedule_with_warmup(
+    #     optimizer, 
+    #     num_warmup_steps=num_warmup_steps, 
+    #     num_training_steps=num_training_steps
+    # )
+
+    for epoch in tqdm(range(epochs)):
         for batch in range(batches_per_epoch): 
             global_step += 1
             x, y = get_batch(data, batch_size, block_size, device)
-            logits, loss = model(x, y)
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
+            with torch.amp.autocast("cuda"):
+                logits, loss = model(x, y)  # Forward pass is now automatically cast
+            scaler.scale(loss).backward()      # Scale loss and call backward
+            scaler.step(optimizer)             # Unscale gradients, check for infs/NaNs, and update parameters
+            scaler.update()                    # Update the scaler for the next iteration
+
             if global_step % 100 == 0 and rank == 0:
                 print(f"Rank {rank} | Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
                 prompt_str = "只见这袭人在床上睡着了，"
@@ -273,9 +293,6 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
                 generated = model.module.generate(prompt_tensor, max_new_tokens=200)
                 generated_text = hf_tokenizer.decode(generated[0].tolist())
                 print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
-
-            # if rank == 1:
-            #     print(f"Rank 1 | Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
 
             if global_step % 5000 == 0 and rank == 0:
                 checkpoint = {
@@ -287,6 +304,8 @@ def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
                 }
                 torch.save(checkpoint, f"pre-trained/hongloumeng_checkpoint_step_{global_step}.pth")
                 print(f"Checkpoint saved at step {global_step}")
+
+        # scheduler.step() # Update the learning rate at the end of each epoch
     
     if rank == 0:
         # Save the final model and tokenizer in Hugging Face format

@@ -314,7 +314,7 @@ def train_model_parallel(data_path="data/Hongloumeng.txt"):
     # Load data
     data, vocab_size = load_data_bpe(data_path, hf_tokenizer)
     block_size = 2048
-    epochs = 500 
+    epochs = 800 
 
     # Build model config
     config_model = GPTConfig(

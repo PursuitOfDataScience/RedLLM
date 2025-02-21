@@ -23,7 +23,7 @@ This project is dedicated to pretraining a large language model (LLM) on the cla
 - **Inference**: Once pretrained, the model can generate text in the style of *Dream of the Red Chamber*, providing insights into classical literature with modern language modeling techniques.
 
 ## Compute
-1 DGX A100 node with 8 GPUs (each with 80G HBM) to run `pretrain.py`. The entire script took 9.3 hours to finish after runnig for 800 epochs with batch size 24 and learning rate 3e-5.
+1 DGX A100 node with 8 GPUs (each with 80G HBM) to run `pretrain_mp.py`. The entire script took 9.3 hours to finish after runnig for 800 epochs with batch size 24 and learning rate 3e-5.
 
 ![](images/hongloumeng-0220.png)
 

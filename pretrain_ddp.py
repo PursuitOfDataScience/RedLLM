@@ -1,39 +1,79 @@
 import os
-import math
+import socket
 import json
+import math
+
+# -----------------------------
+# MPI + Intel GPU / oneCCL imports
+# -----------------------------
+from mpi4py import MPI
 import torch
+import torch.distributed as dist
+import oneccl_bindings_for_pytorch as torch_ccl
+import intel_extension_for_pytorch as ipex
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Standard PyTorch / Transformers imports
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from tqdm import tqdm
+
 from tokenizers import ByteLevelBPETokenizer
 from transformers import (
     PreTrainedTokenizerFast,
     PretrainedConfig,
     PreTrainedModel,
-    AutoModelForCausalLM,
-    AutoTokenizer
 )
+from tqdm import tqdm
 
 #####################################
-# BPE Tokenizer Utilities
+# 1) MPI-based Setup
+#####################################
+
+comm = MPI.COMM_WORLD
+SIZE = comm.Get_size()    # total number of processes
+RANK = comm.Get_rank()    # this process's rank
+LOCAL_RANK = os.environ.get('PALS_LOCAL_RANKID', '0')
+
+# Set environment variables used by PyTorch for DDP
+os.environ['RANK'] = str(RANK)
+os.environ['WORLD_SIZE'] = str(SIZE)
+
+# Hostname logic for MASTER_ADDR
+MASTER_ADDR = socket.gethostname() if RANK == 0 else None
+MASTER_ADDR = comm.bcast(MASTER_ADDR, root=0)
+os.environ['MASTER_ADDR'] = f"{MASTER_ADDR}.hsn.cm.aurora.alcf.anl.gov"
+os.environ['MASTER_PORT'] = str(2345)
+
+print(f"[DDP] Hi from rank {RANK} of {SIZE} with local rank {LOCAL_RANK}. MASTER_ADDR={os.environ['MASTER_ADDR']}")
+
+# Initialize process group (oneCCL) for distributed comm
+dist.init_process_group(
+    backend='ccl',
+    init_method='env://',
+    rank=int(RANK),
+    world_size=int(SIZE)
+)
+
+# Pin this process to the local XPU device
+torch.xpu.set_device(int(LOCAL_RANK))
+device = torch.device('xpu')
+torch.manual_seed(0)
+
+#####################################
+# 2) Tokenizer Utilities
 #####################################
 
 def train_bpe_tokenizer(file_path, vocab_size=5000):
     """Train a ByteLevel BPE tokenizer on the text and save it in Hugging Face format."""
-    # Train using the tokenizers library
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train([file_path], vocab_size=vocab_size, min_frequency=2,
                     special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
     os.makedirs("bpe_tokenizer", exist_ok=True)
-    # Save raw vocab and merges files (for reference)
     tokenizer.save_model("bpe_tokenizer")
-    # Save the full tokenizer JSON representation
     with open(os.path.join("bpe_tokenizer", "tokenizer.json"), "w", encoding="utf-8") as f:
         f.write(tokenizer._tokenizer.to_str())
-    # Create a tokenizer configuration
+
     tokenizer_config = {
         "model_max_length": 1024,
         "bos_token": "<s>",
@@ -44,7 +84,7 @@ def train_bpe_tokenizer(file_path, vocab_size=5000):
     }
     with open(os.path.join("bpe_tokenizer", "tokenizer_config.json"), "w") as f:
         json.dump(tokenizer_config, f)
-    # Create a Hugging Face PreTrainedTokenizerFast instance using the saved tokenizer.json file
+
     hf_tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=os.path.join("bpe_tokenizer", "tokenizer.json"),
         bos_token="<s>",
@@ -65,7 +105,6 @@ def load_data_bpe(file_path, tokenizer):
     """Read the text file, encode it with the BPE tokenizer, and return a tensor of token IDs."""
     with open(file_path, 'r', encoding='utf-8') as f:
         text = f.read()
-    # Use the returned list of token IDs directly
     token_ids = tokenizer.encode(text)
     data = torch.tensor(token_ids, dtype=torch.long)
     return data, tokenizer.vocab_size
@@ -79,7 +118,7 @@ def get_batch(data, batch_size, block_size, device):
     return x, y
 
 #####################################
-# Model Definition - Updated for HF compatibility
+# 3) Model Definition (GPT)
 #####################################
 
 class GPTConfig(PretrainedConfig):
@@ -93,8 +132,74 @@ class GPTConfig(PretrainedConfig):
         self.n_embd = n_embd
         self.dropout = dropout
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0, "Embedding dim must be divisible by n_head"
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.query = nn.Linear(config.n_embd, config.n_embd)
+        self.key = nn.Linear(config.n_embd, config.n_embd)
+        self.value = nn.Linear(config.n_embd, config.n_embd)
+
+        self.attn_drop = nn.Dropout(config.dropout)
+        self.resid_drop = nn.Dropout(config.dropout)
+        self.proj = nn.Linear(config.n_embd, config.n_embd)
+
+        # causal mask
+        self.register_buffer("mask",
+            torch.tril(torch.ones(config.block_size, config.block_size))
+                 .view(1, 1, config.block_size, config.block_size)
+        )
+
+    def forward(self, x):
+        B, T, C = x.size()
+        q = self.query(x).view(B, T, self.n_head, self.head_dim).transpose(1,2)
+        k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1,2)
+        v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1,2)
+
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+
+        y = att @ v
+        y = y.transpose(1,2).contiguous().view(B, T, C)
+        y = self.resid_drop(self.proj(y))
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.fc1 = nn.Linear(config.n_embd, 4*config.n_embd)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(4*config.n_embd, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
 class GPT(PreTrainedModel):
     config_class = GPTConfig
+
     def __init__(self, config):
         super().__init__(config)
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
@@ -103,9 +208,10 @@ class GPT(PreTrainedModel):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Manually initialize parameters not handled by modules (e.g. position_embedding)
+
         nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
-        # post_init will call self.apply(self._init_weights)
+
+        # This calls self.apply(self._init_weights)
         self.post_init()
 
     def _init_weights(self, module):
@@ -117,206 +223,141 @@ class GPT(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        b, t = idx.size()
-        assert t <= self.config.block_size, "Sequence length exceeds block size"
-        token_embeddings = self.token_embedding(idx)
-        position_embeddings = self.position_embedding[:, :t, :]
-        x = self.drop(token_embeddings + position_embeddings)
+        B, T = idx.size()
+        assert T <= self.config.block_size, "Sequence length exceeds block size"
+
+        token_emb = self.token_embedding(idx)
+        pos_emb = self.position_embedding[:, :T, :]
+        x = self.drop(token_emb + pos_emb)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.head(x)
+
         loss = None
         if targets is not None:
             logits = logits.view(-1, logits.size(-1))
             targets = targets.view(-1)
             loss = F.cross_entropy(logits, targets)
+
         return logits, loss
-    
+
+    @torch.no_grad()
     def generate(self, input_ids, max_new_tokens, temperature=0.7, top_k=None):
         self.eval()
         generated = input_ids
         for _ in range(max_new_tokens):
-            input_cond = generated if generated.shape[1] <= self.config.block_size else generated[:, -self.config.block_size:]
-            logits, _ = self(input_cond)
+            if generated.size(1) > self.config.block_size:
+                idx_cond = generated[:, -self.config.block_size:]
+            else:
+                idx_cond = generated
+
+            logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
-                values, _ = torch.topk(logits, top_k)
-                logits[logits < values[:, -1:]] = -float('Inf')
-            probs = torch.softmax(logits, dim=-1)
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('inf')
+            probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            generated = torch.cat((generated, next_token), dim=1)
+            generated = torch.cat([generated, next_token], dim=1)
         return generated
 
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0, "Embedding dim must be divisible by n_head"
-        self.n_head = config.n_head
-        self.head_dim = config.n_embd // config.n_head
-        self.query = nn.Linear(config.n_embd, config.n_embd)
-        self.key = nn.Linear(config.n_embd, config.n_embd)
-        self.value = nn.Linear(config.n_embd, config.n_embd)
-        self.attn_drop = nn.Dropout(config.dropout)
-        self.resid_drop = nn.Dropout(config.dropout)
-        self.proj = nn.Linear(config.n_embd, config.n_embd)
-        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size))
-    def forward(self, x):
-        b, t, c = x.size()
-        q = self.query(x).view(b, t, self.n_head, self.head_dim).transpose(1,2)
-        k = self.key(x).view(b, t, self.n_head, self.head_dim).transpose(1,2)
-        v = self.value(x).view(b, t, self.n_head, self.head_dim).transpose(1,2)
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
-        y = y.transpose(1,2).contiguous().view(b, t, c)
-        y = self.resid_drop(self.proj(y))
-        return y
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.drop = nn.Dropout(config.dropout)
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
 #####################################
-# Distributed Training Setup for DDP
+# 4) GPT Training Loop
 #####################################
 
-# def setup(rank, world_size):
-#     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-def setup(rank, world_size):
-    # Explicitly set the CUDA device for the current process
-    torch.cuda.set_device(rank)
-    # Initialize the distributed process group using the NCCL backend
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        rank=rank,
-        world_size=world_size
-    )
-
-def cleanup():
-    dist.destroy_process_group()
-
-def train_ddp(rank, world_size, data_path="data/Hongloumeng.txt"):
-    setup(rank, world_size)
-    device = torch.device(f'cuda:{rank}')
-    
-    # Only rank 0 trains the tokenizer if needed.
-    if not os.path.exists("bpe_tokenizer/vocab.json"):
-        if rank == 0:
-            print("Training BPE tokenizer...")
-            _ = train_bpe_tokenizer(data_path, vocab_size=5000)
-        dist.barrier()
-    hf_tokenizer = load_bpe_tokenizer()
-    
-    # Load data using the tokenizer
-    data, vocab_size = load_data_bpe(data_path, hf_tokenizer)
+def main():
+    # Because we're now using MPI, we already have RANK, SIZE, device set above
+    data_path = "data/Hongloumeng.txt"
     block_size = 256
     epochs = 500
-
-    config_model = GPTConfig(vocab_size=vocab_size, 
-                             block_size=block_size,
-                             n_layer=12, 
-                             n_head=12, 
-                             n_embd=768, 
-                             dropout=0.1)
-    
-    model = GPT(config_model).to(device)
-    model = DDP(model, device_ids=[rank])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
-
-
-    # adding AMP autoscaler
-    scaler = torch.amp.GradScaler("cuda")
-
     batch_size = 24
+    lr = 3e-5
 
+    # Rank 0: Train tokenizer if not present
+    if not os.path.exists("bpe_tokenizer/vocab.json"):
+        if RANK == 0:
+            print("Training BPE tokenizer...")
+            _ = train_bpe_tokenizer(data_path, vocab_size=5000)
+        MPI.COMM_WORLD.barrier()
+
+    # Load tokenizer, data
+    hf_tokenizer = load_bpe_tokenizer()
+    data, vocab_size = load_data_bpe(data_path, hf_tokenizer)
     dataset_size = len(data)
-    print('dataset_size:', dataset_size)
+    print(f"[Rank {RANK}] dataset_size: {dataset_size}")
     batches_per_epoch = dataset_size // (batch_size * block_size)
-    print('batches_per_epoch:', batches_per_epoch)
+    print(f"[Rank {RANK}] batches_per_epoch: {batches_per_epoch}")
+
+    # Initialize model config
+    config_model = GPTConfig(
+        vocab_size=vocab_size,
+        block_size=block_size,
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        dropout=0.1
+    )
+    model = GPT(config_model).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    # Optimize with IPEX before wrapping in DDP
+    model, optimizer = ipex.optimize(model, optimizer=optimizer)
+
+    # Wrap in DDP
+    model = DDP(model)
+
+    # AMP GradScaler
+    scaler = torch.amp.GradScaler()
     global_step = 0
 
-    # from transformers import get_linear_schedule_with_warmup
-
-    # num_training_steps = epochs * batches_per_epoch
-    # num_warmup_steps = int(0.1 * num_training_steps)
-
-    # scheduler = get_linear_schedule_with_warmup(
-    #     optimizer, 
-    #     num_warmup_steps=num_warmup_steps, 
-    #     num_training_steps=num_training_steps
-    # )
-
-    for epoch in tqdm(range(epochs)):
-        for batch in range(batches_per_epoch): 
+    # Training loop
+    for epoch in tqdm(range(epochs), desc="Epochs"):
+        for step in range(batches_per_epoch):
             global_step += 1
             x, y = get_batch(data, batch_size, block_size, device)
             optimizer.zero_grad()
-            with torch.amp.autocast("cuda"):
-                logits, loss = model(x, y)  # Forward pass is now automatically cast
-            scaler.scale(loss).backward()      # Scale loss and call backward
-            scaler.step(optimizer)             # Unscale gradients, check for infs/NaNs, and update parameters
-            scaler.update()                    # Update the scaler for the next iteration
 
-            if global_step % 100 == 0 and rank == 0:
-                print(f"Rank {rank} | Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
+            # AMP autocast on XPU
+            with torch.amp.autocast(device_type='xpu', dtype=torch.bfloat16):
+                _, loss = model(x, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Print / generate on rank 0
+            if (global_step % 100 == 0) and (RANK == 0):
+                print(f"[Rank 0] Epoch {epoch} Step {global_step} Loss {loss.item():.4f}")
                 prompt_str = "只见这袭人在床上睡着了，"
                 token_ids = hf_tokenizer.encode(prompt_str)
                 prompt_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(device)
+                # Generate text from model.module
                 generated = model.module.generate(prompt_tensor, max_new_tokens=200)
-                generated_text = hf_tokenizer.decode(generated[0].tolist())
-                print(f"\n--- Generated text at step {global_step} ---\n{generated_text}\n")
+                out_text = hf_tokenizer.decode(generated[0].cpu().tolist())
+                print(f"\n--- Generated text @ step {global_step} ---\n{out_text}\n")
 
-            if global_step % 5000 == 0 and rank == 0:
-                checkpoint = {
+            # Checkpoint every 5000 steps
+            if (global_step % 5000 == 0) and (RANK == 0):
+                os.makedirs("pre-trained", exist_ok=True)
+                ckpt = {
                     "epoch": epoch,
                     "global_step": global_step,
                     "model_state_dict": model.module.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": loss.item()
                 }
-                torch.save(checkpoint, f"pre-trained/hongloumeng_checkpoint_step_{global_step}.pth")
+                path = f"pre-trained/hongloumeng_checkpoint_step_{global_step}.pth"
+                torch.save(ckpt, path)
                 print(f"Checkpoint saved at step {global_step}")
 
-        # scheduler.step() # Update the learning rate at the end of each epoch
-    
-    if rank == 0:
-        # Save the final model and tokenizer in Hugging Face format
+    # Rank 0 saves final model + tokenizer
+    if RANK == 0:
         model.module.save_pretrained("RedLLM")
         hf_tokenizer.save_pretrained("RedLLM")
-        print("DDP training complete; model and tokenizer saved in 'RedLLM'")
-    cleanup()
+        print("Training complete. Model + tokenizer saved in 'RedLLM'.")
 
-def main():
-    world_size = torch.cuda.device_count()
-    mp.spawn(train_ddp, args=(world_size,), nprocs=world_size, join=True)
+    # Final cleanup
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

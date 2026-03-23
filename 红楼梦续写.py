@@ -32,7 +32,6 @@ TOTAL_CHAPTERS = 28
 START_CHAPTER = 81
 MAX_OUTPUT = 131072
 THINKING_BUDGET = 1024
-MAX_RETRIES = 3
 
 # ========== Prompts ==========
 CORE_PRINCIPLES = """【最高优先级指令——禁止使用高鹗续书】
@@ -175,14 +174,15 @@ def generate_chapter(ch_num, prev_texts):
 
 开始："""
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         text, usage = call_api(SYSTEM_MSG, user, f"v{ch_num}_a{attempt}")
         if text:
             return text, usage
-        if attempt < MAX_RETRIES:
-            print(f"      retry {attempt+1}/{MAX_RETRIES} in {30*attempt}s...")
-            time.sleep(30 * attempt)
-    return None, {}
+        wait = min(30 * attempt, 300)  # cap at 5 min
+        print(f"      retry #{attempt} in {wait}s...", flush=True)
+        time.sleep(wait)
 
 def count_completed():
     if not os.path.exists(JSONL_FILE):
@@ -255,27 +255,22 @@ def generate_version(vid, resume_data=None):
         text, usage = generate_chapter(ch, texts)
         elapsed = time.time() - t0
 
-        if text:
-            n = len(text)
-            data["chapters"].append({
-                "chapter_number": ch,
-                "text": text,
-                "char_count": n,
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-            })
-            texts.append(text)
-            data["total_input_tokens"] += usage.get("input_tokens", 0)
-            data["total_output_tokens"] += usage.get("output_tokens", 0)
+        n = len(text)
+        data["chapters"].append({
+            "chapter_number": ch,
+            "text": text,
+            "char_count": n,
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        })
+        texts.append(text)
+        data["total_input_tokens"] += usage.get("input_tokens", 0)
+        data["total_output_tokens"] += usage.get("output_tokens", 0)
 
-            # Save progress after every chapter
-            save_progress(data)
+        save_progress(data)
 
-            mark = "✓" if n >= 3000 else "~"
-            print(f"    {mark} 第{ch}回 {n}字 ({elapsed:.0f}s)", flush=True)
-        else:
-            print(f"    ✗ 第{ch}回 failed after {MAX_RETRIES} retries, aborting version", flush=True)
-            return None
+        mark = "✓" if n >= 3000 else "~"
+        print(f"    {mark} 第{ch}回 {n}字 ({elapsed:.0f}s)", flush=True)
 
         if i < TOTAL_CHAPTERS - 1:
             time.sleep(10)
@@ -305,12 +300,7 @@ if progress:
     vid = progress["version_id"]
     print(f"\n📖 Version {vid}/{TOTAL_VERSIONS} (resuming)  [{datetime.now().strftime('%Y-%m-%d %H:%M')}]")
     result = generate_version(vid, resume_data=progress)
-    if result:
-        print(f"  ✅ {result['total_chars']:,}字 avg={result['avg_chars_per_chapter']}字/回")
-        done += 1
-    else:
-        print(f"  ❌ Version {vid} failed, skipping")
-        clear_progress()
+    print(f"  ✅ {result['total_chars']:,}字 avg={result['avg_chars_per_chapter']}字/回")
     start_v = vid + 1
     if start_v <= TOTAL_VERSIONS:
         time.sleep(30)
@@ -321,11 +311,7 @@ for v in range(start_v, TOTAL_VERSIONS + 1):
 
     print(f"\n📖 Version {v}/{TOTAL_VERSIONS}  [{datetime.now().strftime('%Y-%m-%d %H:%M')}]")
     result = generate_version(v)
-
-    if result:
-        print(f"  ✅ {result['total_chars']:,}字 avg={result['avg_chars_per_chapter']}字/回")
-    else:
-        print(f"  ❌ Version {v} failed, skipping")
+    print(f"  ✅ {result['total_chars']:,}字 avg={result['avg_chars_per_chapter']}字/回")
 
     if v < TOTAL_VERSIONS:
         time.sleep(30)

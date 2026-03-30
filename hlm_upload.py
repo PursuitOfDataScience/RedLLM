@@ -8,7 +8,7 @@ Usage:
     python hlm_upload.py <jsonl_path>
 
 Example:
-    python hlm_upload.py ./data/hlm_continuations.jsonl
+    python hlm_upload.py /project/rcc/youzhi/data/hlm_continuations.jsonl
 """
 import sys, os, json, tempfile
 
@@ -107,12 +107,13 @@ pretty_name: 红楼梦续写 · Dream of the Red Chamber Continuations
 
 ### 生成方式
 
-- **模型**：MiniMax-M2.7（通过Anthropic兼容API调用）
+- **模型**：MiniMax-M2.7
 - **策略**：每回独立调用一次API（每版本28次，共{num_versions * 28:,}次调用）
 - **上下文管理**：最近3回完整传入，更早章回压缩为回目+摘要
 - **独立性**：{num_versions}个版本之间完全独立，不共享任何状态
 - **容错**：无限重试，指数退避，不丢弃任何章回或版本
 - **断点续跑**：每完成一回保存进度，中断后可从断点恢复
+- **生成脚本**：[红楼梦续写.py](https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/红楼梦续写.py)
 
 ### 核心约束（写入Prompt）
 
@@ -211,6 +212,7 @@ For reference, Cao Xueqin's original chapters average ~6,000–8,000 characters 
 - **Independence**: Each of the {num_versions} versions is generated from scratch with no shared state between versions
 - **Retry policy**: Infinite retry with exponential backoff (30s, 60s, ... up to 5 min) — no chapter or version is ever skipped
 - **Progress saving**: Checkpoint saved after every chapter; fully resumable on interruption
+- **Generation script**: [红楼梦续写.py](https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/红楼梦续写.py)
 
 ### Guiding Principles in the Prompt
 
@@ -233,9 +235,6 @@ JSONL (one JSON object per line, one line per version):
 ```json
 {{
   "version_id": 1,
-  "model": "MiniMax-M2.7",
-  "started_at": "2026-03-21T...",
-  "completed_at": "2026-03-21T...",
   "num_chapters": 28,
   "total_chars": 240223,
   "avg_chars_per_chapter": 8579,
@@ -338,13 +337,28 @@ api = HfApi()
 print(f"📦 Creating repo: {REPO_ID}")
 create_repo(REPO_ID, repo_type="dataset", exist_ok=True)
 
-print(f"📤 Uploading JSONL ({file_size_mb:.1f} MB)...")
+print(f"📤 Cleaning & uploading JSONL ({file_size_mb:.1f} MB)...")
+DROP_KEYS = {"started_at", "completed_at", "model"}
+clean_path = jsonl_path + ".clean"
+with open(jsonl_path, "r", encoding="utf-8") as fin, \
+     open(clean_path, "w", encoding="utf-8") as fout:
+    for line in fin:
+        line = line.strip()
+        if not line:
+            continue
+        v = json.loads(line)
+        for k in DROP_KEYS:
+            v.pop(k, None)
+        fout.write(json.dumps(v, ensure_ascii=False) + "\n")
+        del v
+
 api.upload_file(
-    path_or_fileobj=jsonl_path,
+    path_or_fileobj=clean_path,
     path_in_repo="hlm_continuations.jsonl",
     repo_id=REPO_ID,
     repo_type="dataset",
 )
+os.remove(clean_path)
 
 print("📤 Uploading README...")
 with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:

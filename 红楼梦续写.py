@@ -176,6 +176,12 @@ def call_claude(system, user_msg):
     except json.JSONDecodeError:
         print(f"      claude exit {proc.returncode}: {(proc.stderr or proc.stdout)[-300:].strip()}", flush=True)
         return None, {}
+    if resp.get("api_error_status") == 429 or (resp.get("is_error") and re.search(
+            r"hit your .*limit|usage limit|spend limit", str(resp.get("result")), re.I)):
+        # The seat's usage limit is shared with interactive Claude Code: stop rather than
+        # take the quota back the moment it resets. Progress is saved; rerun to resume.
+        print(f"      claude usage limit: {str(resp.get('result'))[:200]}\n🛑 stopped", flush=True)
+        sys.exit(3)
     if resp.get("is_error") or resp.get("stop_reason") != "end_turn" or not resp.get("result"):
         print(f"      claude: {resp.get('stop_reason')} {str(resp.get('result'))[:200]}", flush=True)
         return None, {}

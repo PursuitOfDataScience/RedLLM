@@ -1,5 +1,6 @@
 pre-trained/*
 __pycache__
 *.sh
+!hlm_worker.sh
 make_plot.py
 test.py

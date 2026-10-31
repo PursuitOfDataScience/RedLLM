@@ -95,14 +95,17 @@ def cn_num(n):
     return s + (d[u] if u else "")
 
 def clean_chapter(text, ch_num):
-    """Cut anything written before this chapter's 回目 (low effort can leak its plan
-    there, even on the same line), number the heading in Chinese, and turn ASCII
-    quotes into “” and ‘’. Quotes alternate across the whole text because quoted
-    poems span lines. None means no 回目 was found, so the caller retries."""
-    m = re.search(rf"第(?:{cn_num(ch_num)}|{ch_num})回[ \t　]+(?=\S)", text)
-    if not m:
+    """Cut anything written before this chapter's 回目, number the heading in Chinese,
+    and turn ASCII quotes into “” and ‘’. A leaked plan can precede the 回目, even on
+    its line, and open with a draft 回目 of its own, so the cut is at the last heading
+    with a chapter's worth of text (1,000 characters) after it. Quotes alternate across
+    the whole text because quoted poems span lines. None means no 回目 was found, so
+    the caller retries."""
+    heads = [m.start() for m in re.finditer(rf"第(?:{cn_num(ch_num)}|{ch_num})回[ \t　]+(?=\S)", text)]
+    if not heads:
         return None
-    text = re.sub(rf"^第{ch_num}回", f"第{cn_num(ch_num)}回", text[m.start():].strip())
+    start = next((h for h in reversed(heads) if len(text) - h >= 1000), heads[0])
+    text = re.sub(rf"^第{ch_num}回", f"第{cn_num(ch_num)}回", text[start:].strip())
     for q, pair in (('"', "“”"), ("'", "‘’")):
         parts = text.split(q)
         text = "".join(s + pair[i % 2] for i, s in enumerate(parts[:-1])) + parts[-1]

@@ -1,15 +1,21 @@
 #!/bin/bash
-# Usage: hlm_worker.sh <label> <name>...   (HLM_DATA overrides the data dir)
+# Usage: hlm_worker.sh <label> <name>...
+#   HLM_MODEL sets the model (default claude-opus-5-5), HLM_EFFORT its effort level (default
+#   high) and HLM_DATA the data dir.
 #
-# Finishes one Opus 5.5 (effort high) version in each hlm_runs/<name>/ in turn, resuming any
-# saved progress, appends it to the main JSONL as the next free version_id and publishes the
-# dataset to the Hub. On the Claude seat's usage limit it sleeps until the reset the message
-# names and resumes. Exits after the last name, on a generator crash, or at the next check
-# once hlm_runs/STOP exists. Output goes to hlm_runs/<label>.log. Killing it is safe:
-# progress is saved per chapter, and rerunning with the same names skips merged ones.
+# Finishes one version in each hlm_runs/<name>/ in turn, resuming any saved progress, appends
+# it to the main JSONL as the next free version_id and publishes the dataset to the Hub. Saved
+# progress is kept per model, so a dir's chapters resume only under the model that wrote them.
+# On the Claude seat's usage limit it sleeps until the reset the message names and resumes.
+# Exits after the last name, on a generator crash, or at the next check once hlm_runs/STOP
+# exists. Output goes to hlm_runs/<label>.log. Killing it is safe: progress is saved per
+# chapter, and rerunning with the same names skips merged ones. Don't edit this file while a
+# worker runs it: bash reads the script as it goes.
 LABEL=${1:?usage: hlm_worker.sh <label> <name>...}
 shift
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MODEL=${HLM_MODEL:-claude-opus-5-5}
+EFFORT=${HLM_EFFORT:-high}
 DATA=${HLM_DATA:-/project/rcc/youzhi/data}
 RUNS=$DATA/hlm_runs
 MAIN=$DATA/hlm_continuations.jsonl
@@ -44,7 +50,7 @@ limit_wait() {
     fi
 }
 
-say "started: $*"
+say "started with $MODEL, effort $EFFORT: $*"
 for NAME in "$@"; do
     DIR=$RUNS/$NAME
     mkdir -p "$DIR"
@@ -52,7 +58,7 @@ for NAME in "$@"; do
         [ -e "$RUNS/STOP" ] && { say "STOP file found, exiting"; exit 0; }
         if [ "$(finished "$DIR")" -lt 1 ]; then
             say "$NAME: generating"
-            python -u 红楼梦续写.py "$DIR" --effort high --target 1 >> "$LOG" 2>&1
+            python -u 红楼梦续写.py "$DIR" --model "$MODEL" --effort "$EFFORT" --target 1 >> "$LOG" 2>&1
             rc=$?
             if [ $rc -eq 3 ]; then
                 w=$(limit_wait)

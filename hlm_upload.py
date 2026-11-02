@@ -83,7 +83,8 @@ for m, pm in sorted(per_model.items(), key=lambda kv: min(kv[1]["ids"])):
     avg = pm["chars"] // pm["chapters"] if pm["chapters"] else 0
     model_rows.append(f"| {MODEL_NAMES.get(m, m)} | {len(pm['ids'])} | {id_span(pm['ids'])} | {avg:,} | {pm['chars']:,} | {how} |")
 model_rows = "\n".join(model_rows)
-models_note = " and ".join(MODEL_NAMES.get(m, m) for m in per_model)
+names = [MODEL_NAMES.get(m, m) for m in per_model]
+models_note = " and ".join(filter(None, [", ".join(names[:-1]), names[-1]]))
 
 print(f"   {num_versions} versions, {total_chars_all:,} total chars, {file_size_mb:.1f} MB")
 

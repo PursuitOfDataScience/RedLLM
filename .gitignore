@@ -2,5 +2,6 @@ pre-trained/*
 __pycache__
 *.sh
 !hlm_worker.sh
+!hlm_session.sh
 make_plot.py
 test.py

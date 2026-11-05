@@ -37,10 +37,14 @@ MODEL_NAMES = {
 
 # ========== Compute stats by streaming JSONL (low memory) ==========
 print("📊 Computing dataset statistics...")
+# Keyed by (model, method): "script" versions come from 红楼梦续写.py, "session" ones from a
+# Claude Code session following hlm_session.md. Until a session version exists, the card
+# and the data come out exactly as they did before methods were told apart.
 per_model = defaultdict(lambda: {"ids": [], "chars": 0, "chapters": 0, "efforts": set()})
 all_ids = []
 total_chars_all = 0
 total_chapters_all = 0
+has_session = False
 
 with open(jsonl_path, "r", encoding="utf-8") as f:
     for line in f:
@@ -48,7 +52,9 @@ with open(jsonl_path, "r", encoding="utf-8") as f:
         if not line:
             continue
         v = json.loads(line)
-        pm = per_model[v.get("model", "MiniMax-M2.7")]
+        method = v.get("method", "script")
+        has_session = has_session or method == "session"
+        pm = per_model[(v.get("model", "MiniMax-M2.7"), method)]
         pm["ids"].append(v["version_id"])
         pm["chars"] += v.get("total_chars", 0)
         pm["chapters"] += len(v.get("chapters", []))
@@ -75,16 +81,30 @@ avg_chars_per_chapter = total_chars_all // total_chapters_all if total_chapters_
 file_size_mb = os.path.getsize(jsonl_path) / (1024 * 1024)
 
 model_rows = []
-for m, pm in sorted(per_model.items(), key=lambda kv: min(kv[1]["ids"])):
-    if m.startswith("claude"):
+for (m, method), pm in sorted(per_model.items(), key=lambda kv: min(kv[1]["ids"])):
+    if method == "session":
+        how = f"Claude Code session, `hlm_session.md`, effort {', '.join(sorted(pm['efforts']))}"
+    elif m.startswith("claude"):
         how = f"Claude Code `claude -p`, effort {', '.join(sorted(pm['efforts']))}"
     else:
         how = "MiniMax API, thinking budget 1,024"
     avg = pm["chars"] // pm["chapters"] if pm["chapters"] else 0
     model_rows.append(f"| {MODEL_NAMES.get(m, m)} | {len(pm['ids'])} | {id_span(pm['ids'])} | {avg:,} | {pm['chars']:,} | {how} |")
 model_rows = "\n".join(model_rows)
-names = [MODEL_NAMES.get(m, m) for m in per_model]
+names = list(dict.fromkeys(MODEL_NAMES.get(m, m) for m, _ in per_model))
 models_note = " and ".join(filter(None, [", ".join(names[:-1]), names[-1]]))
+
+SCRIPT_URL = "https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/红楼梦续写.py"
+SESSION_URL = "https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/hlm_session.md"
+if has_session:
+    how_made = f"""- **Script versions** (`"method": "script"`): one model call per chapter, 28 per version, and versions share no state. Context: the last 3 chapters in full, earlier ones cut to title plus 600 characters. Every model gets the same prompts: [红楼梦续写.py]({SCRIPT_URL}).
+- **Session versions** (`"method": "session"`): one Claude Code session per version follows [hlm_session.md]({SESSION_URL}), with the same rules. It reads 第七十八回 to 第八十回, outlines all 28 chapters, then writes them in order with its own earlier chapters in context, each passing `hlm_session.py check` before the next."""
+    method_note = " Every row has `method`, `script` or `session`. A session version's `input_tokens` counts the conversation re-read on every turn, mostly from cache."
+else:
+    how_made = f"""- One model call per chapter, 28 per version, and versions share no state.
+- Context: the last 3 chapters in full, earlier ones cut to title plus 600 characters.
+- Every model gets the same prompts: [红楼梦续写.py]({SCRIPT_URL})."""
+    method_note = ""
 
 print(f"   {num_versions} versions, {total_chars_all:,} total chars, {file_size_mb:.1f} MB")
 
@@ -153,13 +173,11 @@ Every version is told to follow the 判词 and 红楼梦曲, keep each character
 
 ## ⚙️ How it was made 生成方式
 
-- One model call per chapter, 28 per version, and versions share no state.
-- Context: the last 3 chapters in full, earlier ones cut to title plus 600 characters.
-- Every model gets the same prompts: [红楼梦续写.py](https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/红楼梦续写.py).
+{how_made}
 
 ## 🗂️ Format 数据格式
 
-JSONL, one version per line. `output_tokens` includes thinking.
+JSONL, one version per line. `output_tokens` includes thinking.{method_note}
 
 ```json
 {{"version_id": 93, "model": "claude-opus-5-5", "effort": "max", "num_chapters": 28, "total_chars": 140000,
@@ -214,6 +232,8 @@ with open(jsonl_path, "r", encoding="utf-8") as fin, \
         for k in DROP_KEYS:
             v.pop(k, None)
         v.setdefault("effort", None)  # same keys on every row; MiniMax has no effort level
+        if has_session:
+            v.setdefault("method", "script")
         fout.write(json.dumps(v, ensure_ascii=False) + "\n")
         del v
 

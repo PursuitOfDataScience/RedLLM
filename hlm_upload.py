@@ -38,8 +38,8 @@ MODEL_NAMES = {
 # ========== Compute stats by streaming JSONL (low memory) ==========
 print("📊 Computing dataset statistics...")
 # Keyed by (model, method): "script" versions come from 红楼梦续写.py, "session" ones from a
-# Claude Code session following hlm_session.md. Until a session version exists, the card
-# and the data come out exactly as they did before methods were told apart.
+# Claude Code session following the local, untracked brief hlm_session.md. Until a session
+# version exists, the card and the data come out exactly as they did before methods were told apart.
 per_model = defaultdict(lambda: {"ids": [], "chars": 0, "chapters": 0, "efforts": set()})
 all_ids = []
 total_chars_all = 0
@@ -83,7 +83,7 @@ file_size_mb = os.path.getsize(jsonl_path) / (1024 * 1024)
 model_rows = []
 for (m, method), pm in sorted(per_model.items(), key=lambda kv: min(kv[1]["ids"])):
     if method == "session":
-        how = f"Claude Code session, `hlm_session.md`, effort {', '.join(sorted(pm['efforts']))}"
+        how = f"Claude Code session, effort {', '.join(sorted(pm['efforts']))}"
     elif m.startswith("claude"):
         how = f"Claude Code `claude -p`, effort {', '.join(sorted(pm['efforts']))}"
     else:
@@ -95,10 +95,10 @@ names = list(dict.fromkeys(MODEL_NAMES.get(m, m) for m, _ in per_model))
 models_note = " and ".join(filter(None, [", ".join(names[:-1]), names[-1]]))
 
 SCRIPT_URL = "https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/红楼梦续写.py"
-SESSION_URL = "https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/hlm_session.md"
+SESSION_URL = "https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/hlm_session.py"
 if has_session:
     how_made = f"""- **Script versions** (`"method": "script"`): one model call per chapter, 28 per version, and versions share no state. Context: the last 3 chapters in full, earlier ones cut to title plus 600 characters. Every model gets the same prompts: [红楼梦续写.py]({SCRIPT_URL}).
-- **Session versions** (`"method": "session"`): one Claude Code session per version follows [hlm_session.md]({SESSION_URL}), with the same rules. It reads 第七十八回 to 第八十回, outlines all 28 chapters, then writes them in order with its own earlier chapters in context, each passing `hlm_session.py check` before the next."""
+- **Session versions** (`"method": "session"`): one Claude Code session per version follows a written brief with the same rules. It reads 第七十八回 to 第八十回, outlines all 28 chapters, then writes them in order with its own earlier chapters in context, each passing the check in [hlm_session.py]({SESSION_URL}) before the next."""
     method_note = " Every row has `method`, `script` or `session`. A session version's `input_tokens` counts the conversation re-read on every turn, mostly from cache."
 else:
     how_made = f"""- One model call per chapter, 28 per version, and versions share no state.

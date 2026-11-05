@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Tools for writing one 红楼梦续写 version in an interactive Claude Code session (hlm_session.md).
+"""Tools for writing one 红楼梦续写 version in an interactive Claude Code session.
+
+The session follows hlm_session.md, a brief kept next to this script but out of git.
 
     hlm_session.py prepare <dir> --model M --effort E   set up a session folder; hlm_session.sh runs it
     hlm_session.py check <n> [--dir D]                  check chapter n: prints OK, or FIX lines and exits 1
@@ -187,6 +189,8 @@ def cmd_prepare(a):
     d = os.path.abspath(a.dir)
     if os.path.exists(os.path.join(d, "meta.json")):
         sys.exit(f"{d} is already a session folder")
+    if not os.path.exists(BRIEF):
+        sys.exit(f"no brief at {BRIEF}: it is gitignored, so a fresh clone needs its own copy")
     os.makedirs(os.path.join(d, "原著"), exist_ok=True)
     shutil.copyfile(BRIEF, os.path.join(d, "BRIEF.md"))
     for k, lines in enumerate(original()[1], 1):

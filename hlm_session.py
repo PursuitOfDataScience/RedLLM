@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Tools a Claude Code session runs while it writes one 红楼梦续写 version by following
-hlm_session.md, a brief kept next to this script but out of git.
+hlm_session.md, a brief kept next to this script but out of git. The session writes the
+version itself, or hands each version to one subagent at a time and coordinates.
 
     hlm_session.py start                 resume the unfinished version folder, or make the next one
-    hlm_session.py check <n> [--dir D]   check chapter n: prints OK, or FIX lines and exits 1
+    hlm_session.py status                where the unfinished version stands; changes nothing
+    hlm_session.py check <n> [--dir D]   check chapter n: OK; FIX lines, exit 1; STOP, exit 2
     hlm_session.py finish [--dir D]      check all 28 and pack them into D/hlm_continuations.jsonl
     hlm_session.py publish [--dir D] [--main M] [--dry-run]
                                          append the packed version to the dataset and upload it
@@ -13,13 +15,16 @@ written one at a time, so without --dir every command works on the one not yet p
 check holds a chapter to the dataset's hard checks (the ones the worker's post-merge check
 stops on) and to the brief's own rules: the right 回目 number, an 8+8 回目, at least 4,000
 characters, the ending line and “” quotes. Its messages are in Chinese because the writing
-session reads them.
+session reads them. It says STOP when the chapter was written at another model or effort
+than the session's latest request, which is how a subagent that did not inherit the
+session's setting gets caught on its first chapter.
 
-Each command records $CLAUDE_CODE_SESSION_ID in the folder's meta.json, so finish can read
-those sessions' transcripts. The model and effort the chapters were written at come from
-there, as does each chapter's token count: the usage since the previous chapter file was
-written, with input counting cache reads and writes as the script's numbers do. publish runs
-the worker's hlm_merge.py and hlm_upload.py; --dry-run prints the card and changes nothing.
+Each command records $CLAUDE_CODE_SESSION_ID in the folder's meta.json; a subagent shares its
+session's id and keeps its transcript under <session>/subagents/. finish reads all of them:
+the model and effort the chapters were written at come from there, as does each chapter's
+token count, the usage since the previous chapter file was written in the same transcript,
+with input counting cache reads and writes as the script's numbers do. publish runs the
+worker's hlm_merge.py and hlm_upload.py; --dry-run prints the card and changes nothing.
 """
 import argparse, glob, hashlib, json, os, re, shutil, subprocess, sys, tempfile
 from collections import Counter
@@ -192,24 +197,58 @@ def prepare(d):
         with open(os.path.join(d, "原著", f"{k:03d}.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(wrap(lines)) + "\n")
     with open(os.path.join(d, "progress.md"), "w", encoding="utf-8") as f:
-        f.write("# 进度\n\n每写完一回，在下面加一行：回数 | 回目 | 字数 | 一句话要点\n\n")
+        f.write(PROGRESS_HEAD)
     save_meta(d, {"created_at": now(), "sessions": [],
                   "brief_sha256": hashlib.sha256(open(BRIEF, "rb").read()).hexdigest()})
 
 
+def config_root():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def transcripts(sid):
+    """A session's own transcript, then those of the subagents it ran, oldest first."""
+    own = glob.glob(os.path.join(config_root(), "projects", "*", sid + ".jsonl"))
+    subs = glob.glob(os.path.join(config_root(), "projects", "*", sid, "subagents", "*.jsonl"))
+    return own + sorted(subs, key=os.path.getmtime)
+
+
+def session_how():
+    """Model and effort of the calling session's latest request, from its own transcript.
+    A subagent's commands see its parent's session id, so this is the setting the user chose."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    for path in glob.glob(os.path.join(config_root(), "projects", "*", f"{sid}.jsonl")) if sid else []:
+        last = None
+        for line in open(path, encoding="utf-8"):
+            if '"assistant"' not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            m = e.get("message") or {}
+            if (e.get("type") == "assistant" and isinstance(m, dict)
+                    and m.get("model") and not m["model"].startswith("<")):
+                last = (m["model"], e.get("effort"))
+        if last:
+            return last
+    return None
+
+
 def written(d):
-    """Usage and the model and effort behind each chapter file, from the recorded sessions'
-    transcripts. Within a session, each chapter gets the usage since its previous chapter
-    write, and the tail after its last write goes to that chapter; a session that wrote no
-    chapter (one that only ran a check, say) adds nothing. A response spans several transcript
-    lines and a resumed session can copy earlier ones, so a response counts once by id and a
-    file write once by tool-use id. Returns {chapter: (input, output)} and {chapter: (model,
-    effort)}, the latter from each chapter's last write."""
-    root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    """Usage and the model and effort behind each chapter file, from the transcripts of the
+    recorded sessions and their subagents. Within one transcript, each chapter gets the usage
+    since its previous chapter write, and the tail after the last write goes to that chapter;
+    a transcript that wrote no chapter here (a coordinator's, or one that only ran a check)
+    adds nothing. A response spans several transcript lines and a resumed session can copy
+    earlier ones, so a response counts once by id and a file write once by tool-use id.
+    Returns {chapter: (input, output)} and {chapter: (model, effort)}, the latter from each
+    chapter's latest write."""
     tokens, how, seen, tools = {}, {}, set(), set()
     for s in sorted(load_meta(d).get("sessions", []), key=lambda s: parse_ts(s["since"])):
-        since, msgs = parse_ts(s["since"]), {}
-        for path in glob.glob(os.path.join(root, "projects", "*", s["id"] + ".jsonl")):
+        since = parse_ts(s["since"])
+        for path in transcripts(s["id"]):
+            msgs = {}
             for line in open(path, encoding="utf-8"):
                 try:
                     e = json.loads(line)
@@ -234,17 +273,38 @@ def written(d):
                     k = re.fullmatch(r"(\d{3})\.txt", os.path.basename(p))
                     if k and os.path.dirname(p) == d and FIRST <= int(k.group(1)) <= LAST:
                         r["writes"].append(int(k.group(1)))
-        seen.update(msgs)
-        acc, last = [0, 0], None
-        for r in sorted(msgs.values(), key=lambda r: parse_ts(r["ts"])):
-            acc = [acc[0] + r["in"], acc[1] + r["out"]]
-            for n in r["writes"]:
-                a, b = tokens.get(n, (0, 0))
-                tokens[n], how[n], acc, last = (a + acc[0], b + acc[1]), r["how"], [0, 0], n
-        if last is not None:
-            a, b = tokens[last]
-            tokens[last] = (a + acc[0], b + acc[1])
+            seen.update(msgs)
+            acc, last = [0, 0], None
+            for r in sorted(msgs.values(), key=lambda r: parse_ts(r["ts"])):
+                acc = [acc[0] + r["in"], acc[1] + r["out"]]
+                for n in r["writes"]:
+                    a, b = tokens.get(n, (0, 0))
+                    tokens[n], how[n], acc, last = (a + acc[0], b + acc[1]), r["how"], [0, 0], n
+            if last is not None:
+                a, b = tokens[last]
+                tokens[last] = (a + acc[0], b + acc[1])
     return tokens, how
+
+
+PROGRESS_HEAD = "# 进度（每回检查通过后自动更新，不要手改）\n\n"
+
+
+def record_progress(d, gao):
+    """Rebuild progress.md from the chapter files that pass. A session that overwrote it by
+    hand (one did, in testing) loses nothing: the next check writes it back."""
+    lines = []
+    for n in range(FIRST, LAST + 1):
+        t = read_chapter(d, n)
+        if t is None:
+            continue
+        probs, first = problems(n, t, gao)
+        if not probs:
+            m = TITLE.match(first)
+            lines.append(f"第{cn_num(n)}回 | {m.group(1).strip() if m else first} | {len(t)}字\n")
+    p = os.path.join(d, "progress.md")
+    with open(p + ".tmp", "w", encoding="utf-8") as f:
+        f.write(PROGRESS_HEAD + "".join(lines))
+    os.replace(p + ".tmp", p)
 
 
 def next_chapter(d, gao):
@@ -292,13 +352,36 @@ def cmd_check(a):
     if t is None:
         print(f"FIX 第{cn_num(n)}回：{d} 里找不到 {n:03d}.txt")
         sys.exit(1)
-    probs, first = problems(n, t, gao_halves())
+    gao = gao_halves()
+    probs, first = problems(n, t, gao)
     if probs:
         print(f"FIX 第{cn_num(n)}回（{len(t)}字）：")
         for p in probs:
             print(f"- {p}")
         sys.exit(1)
-    print(f"OK 第{cn_num(n)}回：{len(t)}字。{first}")
+    writer, expect = written(d)[1].get(n), session_how()
+    if writer and expect and writer != expect:
+        print(f"STOP 第{cn_num(n)}回是 {writer[0]}、effort {writer[1]} 写的，本会话设的是 "
+              f"{expect[0]}、effort {expect[1]}。停下，不要再写，把这句话原样告诉用户。")
+        sys.exit(2)
+    record_progress(d, gao)
+    tag = f"（{writer[0]}，effort {writer[1]}）" if writer else ""
+    print(f"OK 第{cn_num(n)}回：{len(t)}字。{first}{tag}。progress.md 已更新。")
+
+
+def cmd_status(a):
+    d = unfinished()
+    if d is None:
+        print("没有未发布的版本。")
+        return
+    if os.path.exists(os.path.join(d, "hlm_continuations.jsonl")):
+        print(f"{d}：已打包，还没发布。")
+        return
+    n, ok = next_chapter(d, gao_halves())
+    lines = [l for l in open(os.path.join(d, "progress.md"), encoding="utf-8") if l.startswith("第")]
+    print(f"{d}：已完成 {ok}/28 回" + (f"，正在写第{cn_num(n)}回。" if n else "，待打包。"))
+    if lines:
+        print("最近一回：" + lines[-1].strip())
 
 
 def cmd_finish(a):
@@ -375,6 +458,7 @@ def cmd_publish(a):
 ap = argparse.ArgumentParser(description="Write one 红楼梦续写 version in a Claude Code session.")
 sub = ap.add_subparsers(dest="cmd", required=True)
 sub.add_parser("start", help="resume the unfinished version folder, or make the next one")
+sub.add_parser("status", help="where the unfinished version stands; changes nothing")
 p = sub.add_parser("check", help="check one chapter")
 p.add_argument("n", type=int)
 p.add_argument("--dir")
@@ -385,4 +469,5 @@ p.add_argument("--dir")
 p.add_argument("--main", default=MAIN)
 p.add_argument("--dry-run", action="store_true")
 args = ap.parse_args()
-{"start": cmd_start, "check": cmd_check, "finish": cmd_finish, "publish": cmd_publish}[args.cmd](args)
+{"start": cmd_start, "status": cmd_status, "check": cmd_check, "finish": cmd_finish,
+ "publish": cmd_publish}[args.cmd](args)

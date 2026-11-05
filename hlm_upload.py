@@ -98,7 +98,7 @@ SCRIPT_URL = "https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/�
 SESSION_URL = "https://github.com/PursuitOfDataScience/RedLLM/blob/transformers/hlm_session.py"
 if has_session:
     how_made = f"""- **Script versions** (`"method": "script"`): one model call per chapter, 28 per version, and versions share no state. Context: the last 3 chapters in full, earlier ones cut to title plus 600 characters. Every model gets the same prompts: [红楼梦续写.py]({SCRIPT_URL}).
-- **Session versions** (`"method": "session"`): one Claude Code session per version follows a written brief with the same rules. It reads 第七十八回 to 第八十回, outlines all 28 chapters, then writes them in order with its own earlier chapters in context, each passing the check in [hlm_session.py]({SESSION_URL}) before the next."""
+- **Session versions** (`"method": "session"`): each version is written by its own Claude Code session or subagent, following a written brief with the same rules. It reads 第七十八回 to 第八十回, outlines all 28 chapters, then writes them in order with its own earlier chapters in context, each passing the check in [hlm_session.py]({SESSION_URL}) before the next."""
     method_note = " Every row has `method`, `script` or `session`. A session version's `input_tokens` counts the conversation re-read on every turn, mostly from cache."
 else:
     how_made = f"""- One model call per chapter, 28 per version, and versions share no state.
